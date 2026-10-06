@@ -119,19 +119,35 @@ def _problem(
     headers: Mapping[str, str] | None = None,
     errors: list[FieldError] | None = None,
 ) -> JSONResponse:
-    problem = Problem(
+    problem = _build(request, status, code, detail, errors=errors)
+    return JSONResponse(
+        problem.model_dump(mode="json", exclude_none=True),
+        status_code=status,
+        headers=headers,
+        media_type=PROBLEM_MEDIA_TYPE,
+    )
+
+
+def problem_of(request: Request, exc: TranscriptionError) -> Problem:
+    """``exc`` as a problem body, for responses that carry several (batch items)."""
+    return _build(request, exc.http_status, exc.code, exc.message)
+
+
+def _build(
+    request: Request,
+    status: int,
+    code: str,
+    detail: str,
+    *,
+    errors: list[FieldError] | None = None,
+) -> Problem:
+    return Problem(
         title=HTTPStatus(status).phrase,
         status=status,
         detail=detail,
         code=code,
         request_id=_request_id(request),
         errors=errors,
-    )
-    return JSONResponse(
-        problem.model_dump(mode="json", exclude_none=True),
-        status_code=status,
-        headers=headers,
-        media_type=PROBLEM_MEDIA_TYPE,
     )
 
 

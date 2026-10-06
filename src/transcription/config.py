@@ -53,7 +53,10 @@ class Settings(PipelineConfig, BaseSettings):
 
     # --- admission limits ------------------------------------------------------------
     max_direct_upload_bytes: int = 100 * MiB
-    """Raw-body uploads through the API. Bigger files must use a presigned upload."""
+    """Raw-body uploads through the API, a whole batch included. Bigger files must use a
+    presigned upload."""
+    max_batch_files: int = 20
+    """Files per ``POST /v1/transcriptions/batch``."""
     max_presigned_upload_bytes: int = 2048 * MiB
     max_pending_jobs: int = 200
     """Global backpressure: queued+processing jobs above this → 429 queue_full."""

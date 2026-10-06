@@ -51,7 +51,13 @@ def rate_limit(
     services: ServicesDep,
     api_key: Annotated[ApiKeyRecord, Depends(require_api_key)],
 ) -> ApiKeyRecord:
-    """Count this request against the key's per-minute budget and return the key.
+    """Count this request against the key's per-minute budget and return the key."""
+    charge(request, services, api_key)
+    return api_key
+
+
+def charge(request: Request, services: Services, api_key: ApiKeyRecord, *, cost: int = 1) -> None:
+    """Count ``cost`` requests against the key's per-minute budget; 429 when over it.
 
     Writes use ``api_keys.rate_limit_per_minute`` (or the global default); GETs use
     ``READ_LIMIT_MULTIPLIER`` times that in a separate bucket. RateLimit-* headers go
@@ -61,7 +67,7 @@ def rate_limit(
         bucket, limit = "read", limit * READ_LIMIT_MULTIPLIER
     else:
         bucket = "write"
-    decision = services.rate_limiter.hit(f"{api_key.id}:{bucket}", limit=limit)
+    decision = services.rate_limiter.hit(f"{api_key.id}:{bucket}", limit=limit, cost=cost)
     add_response_headers(
         request,
         {
@@ -72,7 +78,6 @@ def rate_limit(
     )
     if not decision.allowed:
         raise RateLimitedError(retry_after_s=decision.reset_s)
-    return api_key
 
 
 AuthorizedKey = Annotated[ApiKeyRecord, Depends(rate_limit)]

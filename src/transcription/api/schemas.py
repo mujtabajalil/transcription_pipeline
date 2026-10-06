@@ -12,6 +12,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, Field
 
+from transcription.api.problems import Problem
 from transcription.db.repo import JobRecord
 from transcription.domain import JobStatus, Segment, TranscriptionOptions, TranscriptStats
 from transcription.storage import PresignedUpload
@@ -157,6 +158,20 @@ class TranscriptionList(BaseModel):
     next_cursor: datetime | None = Field(
         description="Pass as ``before`` to get the next page; null on the last page."
     )
+
+
+class BatchItem(BaseModel):
+    filename: str | None
+    status: int = Field(
+        description="What this file alone would have got: 202 created, 200 replayed or "
+        "deduplicated, otherwise the status of ``error``."
+    )
+    job: TranscriptionJob | None = Field(description="Null when the file was rejected.")
+    error: Problem | None = Field(description="Why the file was rejected; null otherwise.")
+
+
+class TranscriptionBatch(BaseModel):
+    data: list[BatchItem] = Field(description="One item per file, in upload order.")
 
 
 class HealthResponse(BaseModel):

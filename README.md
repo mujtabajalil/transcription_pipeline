@@ -109,6 +109,16 @@ curl -X POST "http://localhost:8000/v1/transcriptions?language=en" \
 # 202 Accepted, Location: /v1/transcriptions/{id}
 ```
 
+**Several files at once:** repeat the `file` part of a multipart body (≤ 100 MB in total,
+≤ 20 files). Each file becomes its own job and is accepted or rejected on its own.
+
+```bash
+curl -X POST "http://localhost:8000/v1/transcriptions/batch?language=en" \
+  -H "Authorization: Bearer $KEY" \
+  -F file=@samples/hello.mp3 -F file=@samples/monologue.mp3
+# 207 Multi-Status, {"data": [{filename, status, job, error}, ...]} in upload order
+```
+
 **Large files (≤ 2 GiB):** request a presigned upload, POST the file straight to S3, then
 create the job from the upload.
 
@@ -134,6 +144,7 @@ curl -H "Authorization: Bearer $KEY" "http://localhost:8000/v1/transcriptions/{i
 |---|---|
 | `POST /v1/uploads` | Presigned S3 POST; S3 enforces the size limit |
 | `POST /v1/transcriptions` | Create a job from a raw body or an `upload_id` (202) |
+| `POST /v1/transcriptions/batch` | One job per file of a multipart body (207, per-file results) |
 | `GET /v1/transcriptions/{id}` | Status, progress, error and transcript |
 | `GET /v1/transcriptions` | List your jobs, newest first, cursor-paginated |
 | `GET /v1/transcriptions/{id}/subtitles` | SRT or WebVTT captions |

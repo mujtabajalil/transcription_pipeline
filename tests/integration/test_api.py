@@ -584,6 +584,113 @@ def test_private_or_plain_http_webhook_is_400(
     assert_problem(response, 400, "bad_request")
 
 
+# --- batch uploads ---------------------------------------------------------------------
+def post_batch(
+    client: TestClient,
+    auth: Auth,
+    files: list[tuple[str, bytes]],
+    *,
+    params: dict[str, Any] | None = None,
+    **headers: str,
+) -> Any:
+    return client.post(
+        "/v1/transcriptions/batch",
+        files=[("file", (name, data, "audio/mpeg")) for name, data in files],
+        params=params,
+        headers={**auth, **headers},
+    )
+
+
+def test_batch_admits_each_file_on_its_own(
+    client: TestClient,
+    repo: Repository,
+    make_key: Callable[..., Auth],
+    hello: bytes,
+    samples_dir: Path,
+    s3_client: Any,
+    redis_client: Redis,
+    redis_namespace: str,
+    spool_dir: Path,
+) -> None:
+    auth = make_key(rate_limit=10)
+    files = [
+        ("hello.mp3", hello),
+        ("evil.m3u8", (samples_dir / "evil.m3u8").read_bytes()),
+        ("gaps.mp3", (samples_dir / "gaps.mp3").read_bytes()),
+    ]
+
+    response = post_batch(client, auth, files, params={"language": "en"})
+
+    assert response.status_code == 207, response.text
+    assert response.headers["RateLimit-Remaining"] == "7"  # one request per file
+    items = response.json()["data"]
+    assert [(item["filename"], item["status"]) for item in items] == [
+        ("hello.mp3", 202),
+        ("evil.m3u8", 415),
+        ("gaps.mp3", 202),
+    ]
+    assert items[1]["job"] is None
+    assert items[1]["error"]["code"] == "unsupported_media_type"
+    jobs = repo.list_jobs(key_id(repo, auth))
+    assert {str(job.id) for job in jobs} == {items[0]["job"]["id"], items[2]["job"]["id"]}
+    assert all(job.options.language == "en" for job in jobs)
+    assert len(s3_keys(s3_client)) == 2
+    assert stream_length(redis_client, redis_namespace) == 2
+    assert list(spool_dir.iterdir()) == []
+
+
+def test_batch_retry_with_idempotency_key_admits_only_what_was_rejected(
+    open_client: Callable[..., TestClient],
+    repo: Repository,
+    auth: Auth,
+    hello: bytes,
+    samples_dir: Path,
+) -> None:
+    client = open_client(max_pending_jobs=1)
+    files = [("hello.mp3", hello), ("gaps.mp3", (samples_dir / "gaps.mp3").read_bytes())]
+
+    first = post_batch(client, auth, files, **{"Idempotency-Key": "batch-1"}).json()["data"]
+    assert [item["status"] for item in first] == [202, 429]
+    assert first[1]["error"]["code"] == "queue_full"
+    succeed(repo, uuid.UUID(first[0]["job"]["id"]))  # frees the queue
+
+    retry = post_batch(client, auth, files, **{"Idempotency-Key": "batch-1"}).json()["data"]
+
+    assert [item["status"] for item in retry] == [200, 202]
+    assert retry[0]["job"]["id"] == first[0]["job"]["id"]
+    assert len(repo.list_jobs(key_id(repo, auth))) == 2
+
+
+def test_batch_rejects_requests_it_cannot_take_as_a_whole(
+    open_client: Callable[..., TestClient],
+    repo: Repository,
+    make_key: Callable[..., Auth],
+    hello: bytes,
+    spool_dir: Path,
+) -> None:
+    client = open_client(max_batch_files=2)
+    small = open_client(max_direct_upload_bytes=len(hello))
+    auth = make_key()
+    two = [("a.mp3", hello), ("b.mp3", hello)]
+
+    raw = client.post(
+        "/v1/transcriptions/batch", content=hello, headers={"Content-Type": "audio/mpeg", **auth}
+    )
+    assert_problem(raw, 415, "unsupported_media_type")
+    with_field = client.post(
+        "/v1/transcriptions/batch",
+        files=[("file", ("a.mp3", hello))],
+        data={"language": "en"},
+        headers=auth,
+    )
+    assert_problem(with_field, 400, "bad_request")
+    assert_problem(post_batch(client, auth, [*two, ("c.mp3", hello)]), 400, "bad_request")
+    assert_problem(post_batch(small, auth, two), 413, "payload_too_large")
+    assert_problem(post_batch(client, make_key(rate_limit=1), two), 429, "rate_limited")
+    assert repo.list_jobs(key_id(repo, auth)) == []
+    assert list(spool_dir.iterdir()) == []
+
+
 # --- reads -----------------------------------------------------------------------------
 def test_get_queued_job(client: TestClient, auth: Auth, hello: bytes) -> None:
     created = post_audio(
@@ -809,4 +916,6 @@ def test_openapi_documents_security_and_problems(client: TestClient) -> None:
     assert schema["components"]["securitySchemes"]["HTTPBearer"]["scheme"] == "bearer"
     create = schema["paths"]["/v1/transcriptions"]["post"]
     assert {"application/json", "audio/*"} <= create["requestBody"]["content"].keys()
+    batch = schema["paths"]["/v1/transcriptions/batch"]["post"]
+    assert "multipart/form-data" in batch["requestBody"]["content"]
     assert "application/problem+json" in create["responses"]["429"]["content"]

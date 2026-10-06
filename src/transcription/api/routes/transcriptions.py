@@ -1,5 +1,5 @@
-"""Transcription jobs: create (direct upload or presigned upload), read, list, captions,
-delete.
+"""Transcription jobs: create (direct upload, presigned upload or a multipart batch of
+direct uploads), read, list, captions, delete.
 
 Admission control on create runs in the order of docs/DESIGN.md: auth -> rate limit
 (dependencies) -> idempotency replay -> backpressure -> size -> probe -> content dedupe
@@ -13,8 +13,8 @@ import hashlib
 import logging
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -25,12 +25,16 @@ from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
-from transcription.api.deps import AuthorizedKey, ServicesDep
-from transcription.api.problems import problem_responses
+from transcription.api.deps import AuthorizedKey, ServicesDep, charge
+from transcription.api.problems import problem_of, problem_responses
 from transcription.api.schemas import (
     TRANSCRIPTIONS_PATH,
+    BatchItem,
     CreateTranscriptionRequest,
+    TranscriptionBatch,
     TranscriptionJob,
     TranscriptionList,
     TranscriptionParams,
@@ -48,6 +52,8 @@ from transcription.errors import (
     NotReadyError,
     PayloadTooLargeError,
     QueueFullError,
+    TranscriptionError,
+    UnsupportedMediaError,
 )
 from transcription.formats import to_srt, to_vtt
 from transcription.metrics import JOBS_CREATED, JOBS_PENDING, UPLOAD_BYTES
@@ -73,6 +79,21 @@ _CREATE_BODY: dict[str, Any] = {
         },
     }
 }
+_BATCH_BODY: dict[str, Any] = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["file"],
+                    "properties": {"file": {"type": "array", "items": _BINARY["schema"]}},
+                }
+            }
+        },
+    }
+}
+_FILE_READ_CHUNK = 1024 * 1024
 _SUBTITLE_FORMATS: dict[str, tuple[Callable[[Transcript], str], str]] = {
     "srt": (to_srt, "application/x-subrip"),
     "vtt": (to_vtt, "text/vtt"),
@@ -135,7 +156,8 @@ async def create_transcription(
         job, outcome = await _admit_upload(admission, payload.upload_id)
     else:
         admission = await _admission(services, api_key, params, idempotency_key)
-        job, outcome = await _admit_direct(admission, request)
+        body = _body_chunks(request, services.settings.max_direct_upload_bytes)
+        job, outcome = await _admit_direct(admission, body)
     match outcome:
         case _Outcome.CREATED:
             response.headers["Location"] = job_path(job.id)
@@ -146,6 +168,87 @@ async def create_transcription(
             response.status_code = 200
             response.headers["X-Deduplicated"] = "true"
     return TranscriptionJob.from_job(job)
+
+
+@router.post(
+    "/batch",
+    status_code=207,
+    response_model=TranscriptionBatch,
+    responses=problem_responses(400, 401, 413, 415, 422, 429),
+    openapi_extra=_BATCH_BODY,
+)
+async def create_transcription_batch(
+    request: Request,
+    services: ServicesDep,
+    api_key: AuthorizedKey,
+    params: Annotated[TranscriptionParams, Query()],
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            min_length=1,
+            max_length=240,  # leaves room for the per-file suffix in a 255-char column
+            description="Retrying the batch with the same key replays the files it created.",
+        ),
+    ] = None,
+) -> TranscriptionBatch:
+    """One job per file of a ``multipart/form-data`` body (repeat the ``file`` part).
+    Options go in the query string and apply to every file. The whole body counts as
+    one direct upload against ``max_direct_upload_bytes``; each file costs one request
+    of the rate limit.
+
+    Each file is admitted like a single direct upload, independently of the others: a
+    corrupt file or a full queue rejects that file, not the batch. Always 207 once the
+    body is accepted; ``data`` says what happened to each file, in upload order. With an
+    Idempotency-Key, file ``i`` uses ``<key>:<i>``, so retrying a partly rejected batch
+    replays the jobs it created and admits only the rest."""
+    if _media_type(request) != "multipart/form-data":
+        raise UnsupportedMediaError("send the files as multipart/form-data")
+    settings = services.settings
+    parser = MultiPartParser(
+        request.headers,
+        _body_chunks(request, settings.max_direct_upload_bytes),
+        max_files=settings.max_batch_files,
+        max_fields=0,  # options go in the query string, as for a single direct upload
+    )
+    try:
+        form = await parser.parse()
+    except MultiPartException as exc:
+        raise BadRequestError(f"invalid multipart body: {exc.message}") from exc
+    try:
+        files = [value for _, value in form.multi_items() if isinstance(value, UploadFile)]
+        if not files:
+            raise BadRequestError("no files in the request")
+        if len(files) > 1:  # the rate-limit dependency already charged the first
+            await run_in_threadpool(charge, request, services, api_key, cost=len(files) - 1)
+        admission = await _admission(services, api_key, params, idempotency_key)
+        return TranscriptionBatch(
+            data=[await _batch_item(request, admission, i, file) for i, file in enumerate(files)]
+        )
+    finally:
+        await form.close()
+
+
+async def _batch_item(
+    request: Request, admission: _Admission, index: int, file: UploadFile
+) -> BatchItem:
+    if admission.idempotency_key is not None:
+        admission = replace(admission, idempotency_key=f"{admission.idempotency_key}:{index}")
+    try:
+        job, outcome = await _admit_direct(admission, _file_chunks(file))
+    except TranscriptionError as exc:
+        log.info(
+            "batch file rejected",
+            extra={"index": index, "code": exc.code, "status": exc.http_status},
+        )
+        return BatchItem(
+            filename=file.filename, status=exc.http_status, job=None, error=problem_of(request, exc)
+        )
+    return BatchItem(
+        filename=file.filename,
+        status=202 if outcome is _Outcome.CREATED else 200,
+        job=TranscriptionJob.from_job(job),
+        error=None,
+    )
 
 
 @dataclass(frozen=True)
@@ -276,15 +379,18 @@ async def _admit_upload(admission: _Admission, upload_id: uuid.UUID) -> tuple[Jo
     )
 
 
-async def _admit_direct(admission: _Admission, request: Request) -> tuple[JobRecord, _Outcome]:
-    """Raw-body upload: spooled to a temp file (always removed) while hashing, probed
-    so bad files fail now with 415/422, then stored in S3."""
+async def _admit_direct(
+    admission: _Admission, body: AsyncIterator[bytes]
+) -> tuple[JobRecord, _Outcome]:
+    """Direct upload (the raw body, or one file of a batch): spooled to a temp file
+    (always removed) while hashing, probed so bad files fail now with 415/422, then
+    stored in S3."""
     services = admission.services
     with tempfile.NamedTemporaryFile(prefix="tx-upload-") as spool:
         path = Path(spool.name)
-        size, sha256 = await _spool(request, spool, services.settings.max_direct_upload_bytes)
+        size, sha256 = await _spool(body, spool)
         if size == 0:
-            raise BadRequestError("request body is empty")
+            raise BadRequestError("the file is empty")
         # The fingerprint covers the body's hash, so for direct uploads the replay check
         # can only run once the whole body has been received.
         fingerprint = admission.options.fingerprint(f"sha256:{sha256}")
@@ -314,12 +420,12 @@ async def _admit_direct(admission: _Admission, request: Request) -> tuple[JobRec
     return job, outcome
 
 
-async def _spool(request: Request, sink: IO[bytes], limit: int) -> tuple[int, str]:
-    """Write the body to ``sink``; returns (size, sha256 hex)."""
+async def _spool(body: AsyncIterator[bytes], sink: IO[bytes]) -> tuple[int, str]:
+    """Write ``body`` to ``sink``; returns (size, sha256 hex)."""
     digest = hashlib.sha256()
     size = 0
     try:
-        async for chunk in _body_chunks(request, limit):
+        async for chunk in body:
             sink.write(chunk)
             digest.update(chunk)
             size += len(chunk)
@@ -329,7 +435,7 @@ async def _spool(request: Request, sink: IO[bytes], limit: int) -> tuple[int, st
     return size, digest.hexdigest()
 
 
-async def _body_chunks(request: Request, limit: int) -> AsyncIterator[bytes]:
+async def _body_chunks(request: Request, limit: int) -> AsyncGenerator[bytes]:
     """The request body, aborting with 413 once it exceeds ``limit`` bytes.
 
     A declared Content-Length over the limit is refused before reading anything; the
@@ -342,6 +448,14 @@ async def _body_chunks(request: Request, limit: int) -> AsyncIterator[bytes]:
         received += len(chunk)
         if received > limit:
             raise PayloadTooLargeError(f"body exceeds the {limit} byte limit")
+        yield chunk
+
+
+async def _file_chunks(file: UploadFile) -> AsyncIterator[bytes]:
+    # ponytail: copies each file out of Starlette's spool so ffprobe gets a path (2x disk
+    # writes, bounded by max_direct_upload_bytes); parse straight into named temp files
+    # if that ever shows up in a profile.
+    while chunk := await file.read(_FILE_READ_CHUNK):
         yield chunk
 
 

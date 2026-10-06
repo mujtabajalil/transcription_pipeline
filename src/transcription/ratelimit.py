@@ -32,13 +32,14 @@ class RateLimiter:
         self._redis = redis
         self._prefix = prefix
 
-    def hit(self, key: str, *, limit: int, window_s: int = 60) -> RateLimitDecision:
-        """Count one request for ``key`` in the current window. Fails open (allowed=True)
-        if Redis is unreachable — rate limiting must not take the API down; log it."""
+    def hit(self, key: str, *, limit: int, window_s: int = 60, cost: int = 1) -> RateLimitDecision:
+        """Count ``cost`` requests for ``key`` in the current window. Fails open
+        (allowed=True) if Redis is unreachable — rate limiting must not take the API
+        down; log it."""
         name = f"{self._prefix}:{key}"
         try:
             with self._redis.pipeline() as pipe:
-                pipe.incr(name)
+                pipe.incrby(name, cost)
                 # NX (Redis 7): sets the window on the first hit, and also repairs a key
                 # that somehow lost its expiry, without extending a running window.
                 pipe.pexpire(name, window_s * 1000, nx=True)

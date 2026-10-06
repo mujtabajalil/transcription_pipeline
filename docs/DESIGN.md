@@ -128,6 +128,7 @@ Every response carries `X-Request-ID`.
 | `POST /v1/uploads` `{"size_bytes", "content_type"?}` | Presigned S3 POST for large files | 201 `{upload_id, url, fields, expires_at, max_bytes}` |
 | `POST /v1/transcriptions` JSON `{"upload_id", language?, prompt?, split_channels?, word_timestamps?, webhook_url?}` | Transcribe an uploaded object | 202 job |
 | `POST /v1/transcriptions?language=…` raw audio body (`audio/*` or `application/octet-stream`) | Direct upload ≤ `max_direct_upload_bytes`, streamed to disk + sha256, probed before accepting | 202 job |
+| `POST /v1/transcriptions/batch?language=…` multipart, repeated `file` parts | Each file admitted as a direct upload on its own; the whole body ≤ `max_direct_upload_bytes`, ≤ `max_batch_files` files, one rate-limit unit per file | 207 `{data: [{filename, status, job, error}]}` |
 | `GET /v1/transcriptions/{id}` | Status, progress, error, result | 200 |
 | `GET /v1/transcriptions?limit=&before=&status=` | List own jobs, newest first, cursor pagination | 200 |
 | `GET /v1/transcriptions/{id}/subtitles?format=srt\|vtt` | Captions | 200 text; 409 if not succeeded |
@@ -141,6 +142,12 @@ Admission control on create, in order: auth → rate limit (per key, 429 + `Retr
 probed by the worker and fail the job with the same codes) → content dedupe (same key +
 same audio sha256 + same options → existing job, 200) → insert + enqueue → 202 with
 `Location`.
+
+A batch runs that same sequence per file after the body is parsed, so one corrupt file or
+a full queue rejects that file only. Whole-request failures (auth, rate limit, body size,
+too many files, malformed multipart) are still plain problems. With an `Idempotency-Key`,
+file `i` uses `<key>:<i>`: retrying a partly rejected batch replays what was created and
+admits the rest.
 
 Webhook URLs are validated at creation (https, public address) and re-validated before each
 send.
