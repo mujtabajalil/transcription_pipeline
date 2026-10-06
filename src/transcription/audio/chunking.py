@@ -1,10 +1,3 @@
-"""Pack speech regions into chunks of at most one Whisper window that start and end in
-pauses.
-
-Chunks are contiguous slices of the original timeline and never overlap, so stitching
-is ``absolute = chunk.start + t`` with nothing to de-duplicate at the seams.
-"""
-
 from __future__ import annotations
 
 from collections.abc import Iterable
