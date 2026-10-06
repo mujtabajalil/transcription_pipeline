@@ -1,0 +1,5 @@
+#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+file:///etc/passwd
+#EXT-X-ENDLIST

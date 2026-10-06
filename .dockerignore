@@ -1,0 +1,11 @@
+# Allowlist: the image needs only the project metadata, code and migrations. Everything
+# else (.venv, .env, samples, tests, caches, .git) stays out of the build context.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!alembic.ini
+!migrations/
+**/__pycache__
+**/*.pyc

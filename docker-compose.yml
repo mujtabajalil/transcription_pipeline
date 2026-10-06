@@ -1,0 +1,92 @@
+# Local stack. `make infra` starts only the stateful services (for tests / running
+# api+worker on the host); `make up` starts everything.
+name: transcription
+
+x-app: &app
+  build: .
+  env_file: [.env.docker]
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    s3: { condition: service_healthy }
+  volumes:
+    - models:/models
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tx
+      POSTGRES_PASSWORD: tx
+      POSTGRES_DB: tx
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tx -d tx"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Local stand-in for S3 so the api and worker containers share a bucket. The app
+  # talks plain S3 (boto3); with real AWS credentials, unset TX_S3_ENDPOINT_URL and
+  # this service is unused. Tests use moto in-process instead.
+  s3:
+    image: motoserver/moto:latest
+    ports: ["5050:5000"]  # host 5000 is macOS AirPlay
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/moto-api/')\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: schema + bucket before anything serves traffic. api/worker wait for it to
+  # exit 0, so a failed migration stops the rollout instead of running on an old schema.
+  migrate:
+    <<: *app
+    command: ["sh", "-c", "tx-admin migrate && tx-admin init-storage"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      s3: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  worker:
+    <<: *app  # includes the models volume, so the Whisper download survives restarts
+    command: ["tx-worker"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    # SIGTERM → finish and checkpoint the current chunk, release the job (see DESIGN.md).
+    stop_grace_period: 60s
+    deploy:
+      replicas: ${WORKER_REPLICAS:-1}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  models:
